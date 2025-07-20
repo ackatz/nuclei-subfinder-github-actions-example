@@ -8,7 +8,7 @@ I would recommend using this repository only if you have self-hosted runners (i.
 
 ## Getting Started
 
-1. Create a template from this repository by clicking the "Use this template" button on GitHub.
+1. Create a template from this repository by [clicking this link](https://github.com/new?template_name=nuclei-subfinder-github-actions-example&template_owner=ackatz) or the "Use this template" button on GitHub.
 2. Add your domains to the `domains.txt` file in the root of the repository.
 3. Create a GitHub Actions repository secret named `WEBHOOK_URL` with the URL of your webhook receiver (e.g., Slack, Tines, etc.) to receive scan results.
 4. Create a GitHub Actions repository variables named: 

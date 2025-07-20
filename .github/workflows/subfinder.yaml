@@ -1,0 +1,219 @@
+name: 🌐 SubFinder - DNS Enumeration
+
+on:
+  schedule:
+    - cron: '0 1 * * *'  # 1 AM (before Nuclei at 2 AM)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: '1.24'
+
+jobs:
+  subfinder-scan:
+    runs-on: ${{ vars.RUNNER_OS }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Go Environment
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install Security Tools
+        run: |
+          echo "Installing ProjectDiscovery tools..."
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+          
+          # Verify installations
+          subfinder -version
+          dnsx -version
+
+      - name: Initialize Working Files
+        run: |
+          # Create necessary files with proper structure
+          touch subdomains.txt domains.txt
+          
+          # Create backup of original subdomains
+          cp subdomains.txt subdomains_backup.txt
+          
+          echo "=== Initial File Status ==="
+          echo "Subdomains file size: $(wc -l < subdomains.txt) lines"
+          echo "Domains file content:"
+          cat -n domains.txt
+
+      - name: Validate and Clean Existing Subdomains
+        run: |
+          echo "=== Validating Existing Subdomains ==="
+          
+          # Separate comments and domains
+          grep '^#' subdomains.txt > comments.tmp 2>/dev/null || touch comments.tmp
+          grep -v '^#' subdomains.txt | grep -v '^$' | sort -u > existing_domains.tmp
+          
+          if [ -s existing_domains.tmp ]; then
+            echo "Validating $(wc -l < existing_domains.tmp) existing subdomains..."
+            
+            # Validate with timeout and better error handling
+            timeout 10m dnsx -l existing_domains.tmp -silent -a -resp -json | \
+              jq -r 'select(.a != null and .a != []) | .host' | \
+              sort -u > valid_existing.tmp || {
+                echo "DNS validation timed out or failed, keeping original domains"
+                cp existing_domains.tmp valid_existing.tmp
+              }
+            
+            valid_count=$(wc -l < valid_existing.tmp)
+            original_count=$(wc -l < existing_domains.tmp)
+            removed_count=$((original_count - valid_count))
+            
+            echo "Original: $original_count, Valid: $valid_count, Removed: $removed_count"
+          else
+            touch valid_existing.tmp
+            echo "No existing subdomains to validate"
+          fi
+
+      - name: Prepare Target Domains
+        run: |
+          echo "=== Preparing Target Domains ==="
+          
+          # Extract and validate target domains
+          grep -v '^#' domains.txt | grep -v '^$' | \
+            sed 's/[[:space:]]*//g' | sort -u > target_domains.tmp
+          
+          if [ ! -s target_domains.tmp ]; then
+            echo "ERROR: No valid target domains found in domains.txt"
+            exit 1
+          fi
+          
+          echo "Target domains to scan:"
+          cat target_domains.tmp | head -10
+          
+          domain_count=$(wc -l < target_domains.tmp)
+          echo "Total target domains: $domain_count"
+
+      - name: Run SubFinder Enumeration
+        run: |
+          echo "=== Running SubFinder Enumeration ==="
+          
+          # Create output directory
+          mkdir -p results
+          
+          # Run subfinder on each domain (keeping original approach)
+          while read -r domain; do
+            if [ ! -z "$domain" ]; then
+              echo "Scanning: $domain"
+              go run github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest -d "$domain" -silent >> results/subfinder_raw.txt
+            fi
+          done < target_domains.tmp
+          
+          # Process and clean results
+          if [ -f results/subfinder_raw.txt ]; then
+            # Remove protocols, paths, and clean domains
+            sed -E 's|^https?://||g' results/subfinder_raw.txt | \
+              sed -E 's|/.*$||g' | \
+              sed -E 's|:[0-9]+$||g' | \
+              grep -E '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$' | \
+              sort -u > results/new_subdomains.tmp
+            
+            new_found=$(wc -l < results/new_subdomains.tmp)
+            echo "SubFinder found $new_found potential new subdomains"
+          else
+            touch results/new_subdomains.tmp
+            echo "No new subdomains found by SubFinder"
+          fi
+
+      - name: Validate New Subdomains
+        run: |
+          echo "=== Validating New Subdomains ==="
+          
+          if [ -s results/new_subdomains.tmp ]; then
+            echo "Validating $(wc -l < results/new_subdomains.tmp) new subdomains..."
+            
+            # Use dnsx with JSON output for better parsing
+            timeout 15m dnsx \
+              -l results/new_subdomains.tmp \
+              -silent \
+              -a \
+              -resp \
+              -json \
+              -threads 50 | \
+              jq -r 'select(.a != null and .a != []) | .host' | \
+              sort -u > results/valid_new.tmp || {
+                echo "DNS validation failed, skipping new subdomains"
+                touch results/valid_new.tmp
+              }
+            
+            validated_count=$(wc -l < results/valid_new.tmp)
+            echo "Validated $validated_count new subdomains"
+          else
+            touch results/valid_new.tmp
+            echo "No new subdomains to validate"
+          fi
+
+      - name: Merge and Update Subdomains
+        run: |
+          echo "=== Merging Results ==="
+          
+          existing_count=$(wc -l < valid_existing.tmp)
+          new_found_count=$(wc -l < results/valid_new.tmp)
+          
+          cat valid_existing.tmp results/valid_new.tmp | sort -u > results/all_combined.tmp
+          
+          if [ -s valid_existing.tmp ]; then
+            comm -23 <(sort results/valid_new.tmp) <(sort valid_existing.tmp) > results/actually_new.tmp
+            actually_added=$(wc -l < results/actually_new.tmp)
+          else
+            cp results/valid_new.tmp results/actually_new.tmp
+            actually_added=$new_found_count
+          fi
+          
+          {
+            echo "# Automated subdomain enumeration - $(date '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "# Total subdomains: $(wc -l < results/all_combined.tmp)"
+            echo ""
+            cat results/all_combined.tmp
+          } > subdomains_new.txt
+          
+          old_count=$(grep -v '^#' subdomains.txt | grep -v '^$' | wc -l)
+          new_total=$(wc -l < results/all_combined.tmp)
+          echo "Old count: $old_count, New total: $new_total, New found: $new_found_count, Actually added: $actually_added"
+          echo "Subdomains merged into subdomains_new.txt"
+      
+          # Export variables for next step
+          echo "ADDED_COUNT=$actually_added" >> $GITHUB_ENV
+          echo "NEW_TOTAL=$new_total" >> $GITHUB_ENV
+
+      - name: Commit Changes
+        run: |
+          echo "=== Committing Changes ==="
+          
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action [Bot]"
+          
+          if ! cmp -s subdomains.txt subdomains_new.txt; then
+            mv subdomains_new.txt subdomains.txt
+            
+            commit_msg="🔍 DNS Enumeration Update"
+            
+            if [ "$ADDED_COUNT" -gt 0 ]; then
+              commit_msg="$commit_msg - Added $ADDED_COUNT new subdomains"
+            else
+              commit_msg="$commit_msg - No new subdomains found"
+            fi
+            
+            commit_msg="$commit_msg (Total: $NEW_TOTAL)"
+            
+            git add subdomains.txt
+            git commit -m "$commit_msg"
+            git push
+            
+            echo "✅ Changes committed and pushed"
+          else
+            echo "ℹ️ No changes detected, skipping commit"
+          fi

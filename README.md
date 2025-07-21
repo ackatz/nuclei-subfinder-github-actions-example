@@ -21,6 +21,6 @@ I would recommend using this repository **only if you have self-hosted runners**
 5. Go to **Settings** -> **Actions** -> **General** and ✅ check the box next to **Allow GitHub Actions to create and approve pull requests**.
 6. Give it a whirl by running Subfinder, then Nuclei manually or wait until the daily cron task is due.
 
-More on [my blog](https://akatz.org/building-my-own-nuclei-scanning-infrastructure/).
+More on [my blog](https://akatz.org/posts/building-my-own-nuclei-scanning-infrastructure/).
 
 
